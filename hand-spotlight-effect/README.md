@@ -12,25 +12,19 @@ conserva.
 pip install -r requirements.txt
 ```
 
-También hace falta el modelo `hand_landmarker.task` de MediaPipe (no se
-versiona en este repo por tamaño). Se puede descargar, por ejemplo, de:
-
-```
-curl -sSL -o hand_landmarker.task \
-  https://raw.githubusercontent.com/IoT-gamer/hand_landmarker/main/android/src/main/assets/hand_landmarker.task
-```
+También hace falta un modelo Hand Landmarker de MediaPipe (formato `.task`;
+no se versiona en este repo). Se obtiene de la documentación oficial de
+MediaPipe.
 
 Y `ffmpeg` disponible en el PATH (para remuxar el audio original).
 
 ## Uso
 
 ```
-python3 spotlight.py entrada.mp4 salida.mp4 hand_landmarker.task
+python3 spotlight.py <entrada> <salida> <modelo>
 ```
 
-Los tres argumentos son posicionales y opcionales: si se omiten, usa
-`input.mp4`, `output_fingertip.mp4` y `hand_landmarker.task` en el
-directorio actual.
+Los tres argumentos son posicionales y obligatorios.
 
 ## Parámetros del efecto (constantes al inicio de `spotlight.py`)
 

@@ -9,9 +9,9 @@ import os
 import time
 
 # --- entrada / salida ---
-INPUT = sys.argv[1] if len(sys.argv) > 1 else "input.mp4"
-OUTPUT = sys.argv[2] if len(sys.argv) > 2 else "output_fingertip.mp4"
-MODEL = sys.argv[3] if len(sys.argv) > 3 else "hand_landmarker.task"
+if len(sys.argv) != 4:
+    sys.exit("Usage: python3 spotlight.py <input> <output> <model>")
+INPUT, OUTPUT, MODEL = sys.argv[1:4]
 TMP_VIDEO = OUTPUT + ".noaudio.mp4"
 
 # --- parámetros del efecto ---
