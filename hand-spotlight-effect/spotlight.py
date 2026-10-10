@@ -8,11 +8,15 @@ import shutil
 import subprocess
 import os
 import time
+from contextlib import ExitStack
+from pathlib import Path
 
 # --- entrada / salida ---
 if len(sys.argv) != 4:
     sys.exit("Uso: python3 spotlight.py <entrada> <salida> <modelo>")
 INPUT, OUTPUT, MODEL = sys.argv[1:4]
+if Path(INPUT).resolve() == Path(OUTPUT).resolve():
+    sys.exit("La salida no puede ser el mismo archivo que la entrada (ffmpeg -y la sobrescribiría).")
 TMP_VIDEO = OUTPUT + ".noaudio.mp4"
 
 # --- parámetros del efecto ---
@@ -42,6 +46,9 @@ print(f"Video: {width}x{height} @ {fps:.3f}fps, {n_frames} frames")
 
 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
 out = cv2.VideoWriter(TMP_VIDEO, fourcc, fps, (width, height))
+if not out.isOpened():
+    cap.release()
+    sys.exit(f"No se pudo crear el video temporal: {TMP_VIDEO}")
 
 hands_detected_count = 0
 held_hands = {}  # 'Left'/'Right' -> {"points": [...], "age": int}  (retención independiente por mano)
@@ -55,7 +62,16 @@ options = HandLandmarkerOptions(
     min_tracking_confidence=0.5,
 )
 
-with HandLandmarker.create_from_options(options) as landmarker:
+def discard_tmp_on_error(exc_type, exc, tb):
+    # no suprime la excepción: solo evita dejar el .noaudio.mp4 huérfano si el bucle falla
+    if exc_type is not None and os.path.exists(TMP_VIDEO):
+        os.remove(TMP_VIDEO)
+
+
+with ExitStack() as stack, HandLandmarker.create_from_options(options) as landmarker:
+    stack.push(discard_tmp_on_error)
+    stack.callback(cap.release)
+    stack.callback(out.release)
     frame_idx = 0
     while True:
         ret, frame = cap.read()
