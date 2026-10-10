@@ -116,6 +116,20 @@ def estimate_head_pose(landmarks, w: int, h: int) -> tuple[float, float] | None:
     return pitch, yaw
 
 
+def is_looking(
+    ear: float | None,
+    pose: tuple[float, float] | None,
+    ear_threshold: float,
+    pitch_threshold: float,
+    yaw_threshold: float,
+) -> bool:
+    """True when eyes are open and the head faces the screen within the thresholds."""
+    if ear is None or pose is None:
+        return False
+    pitch, yaw = pose
+    return ear >= ear_threshold and abs(pitch) <= pitch_threshold and abs(yaw) <= yaw_threshold
+
+
 def find_vlc_binary() -> str:
     path = shutil.which("vlc")
     if path is None:
@@ -199,13 +213,9 @@ def main() -> None:
                 pose = estimate_head_pose(landmarks, w, h)
                 if pose is not None:
                     pitch, yaw = pose
-                eyes_open = ear >= args.ear_threshold
-                facing_forward = (
-                    pose is not None
-                    and abs(pitch) <= args.pitch_threshold
-                    and abs(yaw) <= args.yaw_threshold
+                looking = is_looking(
+                    ear, pose, args.ear_threshold, args.pitch_threshold, args.yaw_threshold
                 )
-                looking = eyes_open and facing_forward
 
             if args.debug:
                 print(f"looking={looking} ear={ear} pitch={pitch} yaw={yaw}")
