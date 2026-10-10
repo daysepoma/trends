@@ -30,6 +30,8 @@ POSE_MODEL_POINTS = np.array(
     dtype=np.float64,
 )
 
+MAX_FAILED_READS = 30
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -56,9 +58,15 @@ def parse_args() -> argparse.Namespace:
         help="Head pitch in degrees beyond this counts as looking away (default: 18.0)",
     )
     parser.add_argument(
+        "--yaw-threshold",
+        type=float,
+        default=25.0,
+        help="Head yaw in degrees beyond this counts as looking away (default: 25.0)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
-        help="Print live ear/pitch/looking values to help calibrate thresholds",
+        help="Print live ear/pitch/yaw/looking values to help calibrate thresholds",
     )
     return parser.parse_args()
 
@@ -73,7 +81,8 @@ def eye_aspect_ratio(landmarks, indices, w: int, h: int) -> float:
     return vertical / (2.0 * horizontal)
 
 
-def estimate_pitch(landmarks, w: int, h: int) -> float | None:
+def estimate_head_pose(landmarks, w: int, h: int) -> tuple[float, float] | None:
+    """Return (pitch, yaw) in degrees, or None if the pose can't be solved."""
     image_points = np.array(
         [(landmarks[i].x * w, landmarks[i].y * h) for i in POSE_LANDMARKS],
         dtype=np.float64,
@@ -94,12 +103,17 @@ def estimate_pitch(landmarks, w: int, h: int) -> float | None:
 
     rmat, _ = cv2.Rodrigues(rotation_vector)
     angles = cv2.RQDecomp3x3(rmat)[0]
-    pitch = angles[0]
+    pitch, yaw = angles[0], angles[1]
     if pitch < -90:
         pitch = 180 + pitch
     elif pitch > 90:
         pitch = pitch - 180
-    return pitch
+    # A near-frontal face can decompose as yaw ~ +/-180 (Euler ambiguity).
+    if yaw > 90:
+        yaw = yaw - 180
+    elif yaw < -90:
+        yaw = yaw + 180
+    return pitch, yaw
 
 
 def find_vlc_binary() -> str:
@@ -121,14 +135,22 @@ def stop_process(process: subprocess.Popen) -> None:
 
 def main() -> None:
     args = parse_args()
+
+    video_path = Path(args.video)
+    if not video_path.is_file():
+        raise SystemExit(f"Video file not found: {video_path}")
     vlc_bin = find_vlc_binary()
 
     if not MODEL_PATH.exists():
         raise SystemExit(f"Missing model file: {MODEL_PATH}")
 
+    cam = cv2.VideoCapture(args.camera)
+    if not cam.isOpened():
+        raise SystemExit(f"Could not open camera index {args.camera}")
+
     options = FaceLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
-        running_mode=RunningMode.IMAGE,
+        running_mode=RunningMode.VIDEO,
         num_faces=1,
         min_face_detection_confidence=0.5,
         min_face_presence_confidence=0.5,
@@ -136,13 +158,11 @@ def main() -> None:
     )
     landmarker = FaceLandmarker.create_from_options(options)
 
-    cam = cv2.VideoCapture(args.camera)
-    if not cam.isOpened():
-        raise SystemExit(f"Could not open camera index {args.camera}")
-
     process: subprocess.Popen | None = None
-    playing = False
     away_since: float | None = None
+    failed_reads = 0
+    started_at = time.monotonic()
+    last_timestamp_ms = -1
 
     print("Running. Press Ctrl+C to quit.")
 
@@ -150,57 +170,75 @@ def main() -> None:
         while True:
             ok, frame = cam.read()
             if not ok:
-                break
+                failed_reads += 1
+                if failed_reads >= MAX_FAILED_READS:
+                    raise SystemExit(
+                        f"Camera stopped delivering frames ({failed_reads} failed reads in a row)."
+                    )
+                time.sleep(0.05)
+                continue
+            failed_reads = 0
 
             h, w = frame.shape[:2]
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result = landmarker.detect(mp_image)
+            timestamp_ms = max(last_timestamp_ms + 1, int((time.monotonic() - started_at) * 1000))
+            last_timestamp_ms = timestamp_ms
+            result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
             looking = False
             ear = None
             pitch = None
+            yaw = None
             if result.face_landmarks:
                 landmarks = result.face_landmarks[0]
                 ear = (
                     eye_aspect_ratio(landmarks, LEFT_EYE, w, h)
                     + eye_aspect_ratio(landmarks, RIGHT_EYE, w, h)
                 ) / 2.0
-                pitch = estimate_pitch(landmarks, w, h)
+                pose = estimate_head_pose(landmarks, w, h)
+                if pose is not None:
+                    pitch, yaw = pose
                 eyes_open = ear >= args.ear_threshold
-                facing_forward = pitch is not None and abs(pitch) <= args.pitch_threshold
+                facing_forward = (
+                    pose is not None
+                    and abs(pitch) <= args.pitch_threshold
+                    and abs(yaw) <= args.yaw_threshold
+                )
                 looking = eyes_open and facing_forward
 
             if args.debug:
-                print(f"looking={looking} ear={ear} pitch={pitch}")
+                print(f"looking={looking} ear={ear} pitch={pitch} yaw={yaw}")
 
-            now = time.time()
+            now = time.monotonic()
+
+            # VLC may exit on its own (window closed, decode error). Drop the dead
+            # handle and require a fresh threshold before relaunching so a failing
+            # VLC can't be respawned on every frame.
+            if process is not None and process.poll() is not None:
+                print(f"VLC exited unexpectedly (code {process.returncode}).")
+                process = None
+                away_since = now
 
             if looking:
                 away_since = None
-                if playing and process is not None:
+                if process is not None:
                     stop_process(process)
                     process = None
-                    playing = False
-            else:
-                if away_since is None:
-                    away_since = now
-                elif not playing and now - away_since >= args.threshold:
-                    process = subprocess.Popen(
-                        [
-                            vlc_bin,
-                            "--fullscreen",
-                            "--loop",
-                            "--no-video-title-show",
-                            "--quiet",
-                            args.video,
-                        ],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    playing = True
-
-            time.sleep(0.02)
+            elif away_since is None:
+                away_since = now
+            elif process is None and now - away_since >= args.threshold:
+                process = subprocess.Popen(
+                    [
+                        vlc_bin,
+                        "--fullscreen",
+                        "--loop",
+                        "--no-video-title-show",
+                        "--quiet",
+                        str(video_path),
+                    ],
+                    stdout=subprocess.DEVNULL,
+                )
     except KeyboardInterrupt:
         pass
     finally:

@@ -4,13 +4,14 @@ import mediapipe as mp
 from mediapipe.tasks.python import BaseOptions
 from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions, RunningMode
 import numpy as np
+import shutil
 import subprocess
 import os
 import time
 
 # --- entrada / salida ---
 if len(sys.argv) != 4:
-    sys.exit("Usage: python3 spotlight.py <input> <output> <model>")
+    sys.exit("Uso: python3 spotlight.py <entrada> <salida> <modelo>")
 INPUT, OUTPUT, MODEL = sys.argv[1:4]
 TMP_VIDEO = OUTPUT + ".noaudio.mp4"
 
@@ -19,8 +20,18 @@ FINGER_TIP_IDS = [4, 8, 12, 16, 20]  # pulgar, índice, medio, anular, meñique
 PINK_WEIGHTS_BGR = np.array([0.75, 0.35, 1.0], dtype=np.float32)  # tiñe el negativo de rosa
 HOLD_FRAMES = 5  # si un frame puntual no detecta una mano, mantiene su última posición (sin difuminar) para que no parpadee
 
+# --- verificaciones previas (fallar antes de procesar todo el video) ---
+if shutil.which("ffmpeg") is None:
+    sys.exit("No se encontró ffmpeg en el PATH (hace falta para conservar el audio).")
+if not os.path.isfile(MODEL):
+    sys.exit(f"No se encontró el modelo: {MODEL}")
+
 cap = cv2.VideoCapture(INPUT)
+if not cap.isOpened():
+    sys.exit(f"No se pudo abrir el video de entrada: {INPUT}")
 fps = cap.get(cv2.CAP_PROP_FPS)
+if not fps or fps <= 0:
+    sys.exit(f"El video de entrada no reporta fps válidos: {INPUT}")
 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -63,10 +74,16 @@ with HandLandmarker.create_from_options(options) as landmarker:
             hands_detected_count += 1
 
         # actualiza, por mano (Left/Right), sus puntas de dedo detectadas este frame
+        # la clave es etiqueta + ordinal ("Right0", "Right1"...) para que dos
+        # manos con la misma etiqueta (num_hands=4) no se pisen entre sí
         seen_this_frame = set()
+        label_counts = {}
         for i, hand_landmarks in enumerate(result.hand_landmarks):
-            label = result.handedness[i][0].category_name if result.handedness else f"hand{i}"
-            pts = [[int(lm.x * width), int(lm.y * height)] for tip_id in FINGER_TIP_IDS for lm in [hand_landmarks[tip_id]]]
+            base = result.handedness[i][0].category_name if result.handedness else "hand"
+            n = label_counts.get(base, 0)
+            label_counts[base] = n + 1
+            label = f"{base}{n}"
+            pts = [[int(hand_landmarks[t].x * width), int(hand_landmarks[t].y * height)] for t in FINGER_TIP_IDS]
             held_hands[label] = {"points": pts, "age": 0}
             seen_this_frame.add(label)
 
@@ -92,10 +109,12 @@ with HandLandmarker.create_from_options(options) as landmarker:
             # 0 píxeles; el trazo garantiza que la línea siga visible
             cv2.polylines(mask, [hull], isClosed=True, color=255, thickness=line_thickness)
 
-        negative_pink = np.clip((255 - frame.astype(np.float32)) * PINK_WEIGHTS_BGR, 0, 255).astype(np.uint8)
+        # el negativo rosa solo se calcula dentro de la figura (no en todo el frame)
         mask_bool = mask.astype(bool)
         composite = frame.copy()
-        composite[mask_bool] = negative_pink[mask_bool]
+        if mask_bool.any():
+            region = frame[mask_bool].astype(np.float32)
+            composite[mask_bool] = np.clip((255 - region) * PINK_WEIGHTS_BGR, 0, 255).astype(np.uint8)
         out.write(composite)
 
         frame_idx += 1
@@ -114,7 +133,7 @@ subprocess.run(
         "ffmpeg", "-y",
         "-i", TMP_VIDEO,
         "-i", INPUT,
-        "-map", "0:v:0", "-map", "1:a:0",
+        "-map", "0:v:0", "-map", "1:a:0?",
         "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k",
         "-shortest",
