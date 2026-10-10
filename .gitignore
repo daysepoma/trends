@@ -16,3 +16,6 @@ __pycache__/
 *.mpeg
 *.3gp
 *.gif
+
+# Local agent tooling (auto-generated, contains machine paths)
+.atl/
